@@ -87,6 +87,7 @@ var (
 	cpDest        = cp.Arg("dest", "destination prefix or s3Uri to copy to").Required().String()
 	cpSearchDepth = cp.Flag("search-depth", "search depth to search for work.").Default("0").Int()
 	cpKeyRegex    = cp.Flag("key-regex", "regex filter for keys").Default("").String()
+	cpNumRoutines = cp.Flag("num-routines", "number of routines to use when calling aws copy api").Default("10").Int()
 
 	initApp = app.Command("init", "Initialize .fs3cfg file in home directory")
 )
@@ -399,7 +400,7 @@ func Stream(prefixes []string, searchDepth int, keyRegex string, includeKeyName 
 }
 
 // Copy copies src keys under the src prefix to the dest
-func Copy(src string, dest string, keyRegex string, searchDepth int, logger *log.Logger) {
+func Copy(src string, dest string, keyRegex string, searchDepth int, numRoutines int, logger *log.Logger) {
 	var keyRegexFilter *regexp.Regexp = getRegexOrNil(keyRegex)
 
 	copyRequests := make(chan GetRequest, 1000)
@@ -422,7 +423,7 @@ func Copy(src string, dest string, keyRegex string, searchDepth int, logger *log
 	var wg sync.WaitGroup
 	msgs := make(chan string, 1000)
 	b := GetBucket(destBucket)
-	for i := 1; i <= 10; i++ {
+	for i := 1; i <= numRoutines; i++ {
 		wg.Add(1)
 		go func() {
 			for rq := range copyRequests {
@@ -472,7 +473,7 @@ func main() {
 	case "stream":
 		Stream(*streamS3Uris, *streamSearchDepth, *streamKeyRegex, *streamIncludeKeyName, logger)
 	case "cp":
-		Copy(*cpSrc, *cpDest, *cpKeyRegex, *cpSearchDepth, logger)
+		Copy(*cpSrc, *cpDest, *cpKeyRegex, *cpSearchDepth, *cpNumRoutines, logger)
 	case "init":
 		Init(logger)
 	}
