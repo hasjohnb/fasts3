@@ -82,6 +82,12 @@ var (
 	streamKeyRegex       = stream.Flag("key-regex", "regex filter for keys").Default("").String()
 	streamIncludeKeyName = stream.Flag("include-key-name", "regex filter for keys").Bool()
 
+	cp            = app.Command("cp", "Copy s3 files from one bucket to another")
+	cpSrc         = cp.Arg("src", "prefix or s3Uri to copy").Required().String()
+	cpDest        = cp.Arg("dest", "destination prefix or s3Uri to copy to").Required().String()
+	cpSearchDepth = cp.Flag("search-depth", "search depth to search for work.").Default("0").Int()
+	cpKeyRegex    = cp.Flag("key-regex", "regex filter for keys").Default("").String()
+
 	initApp = app.Command("init", "Initialize .fs3cfg file in home directory")
 )
 
@@ -251,42 +257,21 @@ func Get(prefixes []string, searchDepth int, keyRegex string, logger *log.Logger
 		return
 	}
 
-	var keyRegexFilter *regexp.Regexp
-	if keyRegex != "" {
-		keyRegexFilter = regexp.MustCompile(keyRegex)
-	} else {
-		keyRegexFilter = nil
-	}
+	var keyRegexFilter *regexp.Regexp = getRegexOrNil(keyRegex)
+
 	getRequests := make(chan GetRequest, len(prefixes)*2+1)
 	var b *s3.Bucket = nil
 	go func() {
 		for _, prefix := range prefixes {
-			bucket, prefix := parseS3Uri(prefix)
-
-			if b == nil {
-				b = GetBucket(bucket)
-			}
-
-			keyExists, err := b.Exists(prefix)
-			if err != nil {
-				log.Fatalln(err)
-			}
-
-			if keyExists && prefix != "" {
-				if keyRegexFilter != nil && !keyRegexFilter.MatchString(prefix) {
-					continue
-				}
-				keyParts := strings.Split(prefix, "/")
-				ogPrefix := strings.Join(keyParts[0:len(keyParts)-1], "/") + "/"
-				getRequests <- GetRequest{Key: prefix, OriginalPrefix: ogPrefix}
-			} else {
-				for key := range s3wrapper.FastList(b, prefix, searchDepth, true) {
-					if keyRegexFilter != nil && !keyRegexFilter.MatchString(key.Key) {
-						continue
-					}
-					getRequests <- GetRequest{Key: key.Key, OriginalPrefix: prefix}
+			_, actualPrefix := parseS3Uri(prefix)
+			for key := range getKeysWithFilter(prefix, keyRegexFilter, searchDepth) {
+				ogPrefix := actualPrefix
+				if key.Key == prefix {
+					keyParts := strings.Split(prefix, "/")
+					ogPrefix = strings.Join(keyParts[0:len(keyParts)-1], "/") + "/"
 				}
 
+				getRequests <- GetRequest{Key: key.Key, OriginalPrefix: ogPrefix}
 			}
 		}
 		close(getRequests)
@@ -321,6 +306,40 @@ func Get(prefixes []string, searchDepth int, keyRegex string, logger *log.Logger
 	}
 }
 
+func getKeysWithFilter(prefix string, r *regexp.Regexp, searchDepth int) chan s3.Key {
+	keys := make(chan s3.Key, 10000)
+	go func() {
+		defer close(keys)
+		var b *s3.Bucket = nil
+		bucket, prefix := parseS3Uri(prefix)
+
+		if b == nil {
+			b = GetBucket(bucket)
+		}
+
+		keyExists, err := b.Exists(prefix)
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		if keyExists && prefix != "" {
+			if !isKeyMatch(prefix, r) {
+				return
+			}
+			keys <- s3.Key{Key: prefix}
+		} else {
+			for key := range s3wrapper.FastList(b, prefix, searchDepth, true) {
+				if !isKeyMatch(key.Key, r) {
+					continue
+				}
+				keys <- key
+			}
+
+		}
+	}()
+	return keys
+}
+
 // Stream takes a set of prefixes lists them and
 // streams the contents by line
 func Stream(prefixes []string, searchDepth int, keyRegex string, includeKeyName bool, logger *log.Logger) {
@@ -329,39 +348,13 @@ func Stream(prefixes []string, searchDepth int, keyRegex string, includeKeyName 
 		return
 	}
 	keys := make(chan string, len(prefixes)*2+1)
-	var keyRegexFilter *regexp.Regexp
-	if keyRegex != "" {
-		keyRegexFilter = regexp.MustCompile(keyRegex)
-	} else {
-		keyRegexFilter = nil
-	}
+	var keyRegexFilter *regexp.Regexp = getRegexOrNil(keyRegex)
+
 	var b *s3.Bucket = nil
 	go func() {
 		for _, prefix := range prefixes {
-			bucket, prefix := parseS3Uri(prefix)
-
-			if b == nil {
-				b = GetBucket(bucket)
-			}
-
-			keyExists, err := b.Exists(prefix)
-			if err != nil {
-				log.Fatalln(err)
-			}
-
-			if keyExists && prefix != "" {
-				if keyRegexFilter != nil && !keyRegexFilter.MatchString(prefix) {
-					continue
-				}
-				keys <- prefix
-			} else {
-				for key := range s3wrapper.FastList(b, prefix, searchDepth, true) {
-					if keyRegexFilter != nil && !keyRegexFilter.MatchString(key.Key) {
-						continue
-					}
-					keys <- key.Key
-				}
-
+			for key := range getKeysWithFilter(prefix, keyRegexFilter, searchDepth) {
+				keys <- key.Key
 			}
 		}
 		close(keys)
@@ -405,6 +398,66 @@ func Stream(prefixes []string, searchDepth int, keyRegex string, includeKeyName 
 	}
 }
 
+// Copy copies src keys under the src prefix to the dest
+func Copy(src string, dest string, keyRegex string, searchDepth int, logger *log.Logger) {
+	var keyRegexFilter *regexp.Regexp = getRegexOrNil(keyRegex)
+
+	copyRequests := make(chan GetRequest, 1000)
+
+	srcBucket, srcPrefix := parseS3Uri(src)
+	destBucket, destPrefix := parseS3Uri(dest)
+	go func() {
+		for key := range getKeysWithFilter(src, keyRegexFilter, searchDepth) {
+			ogPrefix := srcPrefix
+			if key.Key == src {
+				keyParts := strings.Split(src, "/")
+				ogPrefix = strings.Join(keyParts[0:len(keyParts)-1], "/") + "/"
+			}
+			copyRequests <- GetRequest{Key: key.Key, OriginalPrefix: ogPrefix}
+
+		}
+		close(copyRequests)
+	}()
+
+	var wg sync.WaitGroup
+	msgs := make(chan string, 1000)
+	b := GetBucket(destBucket)
+	for i := 1; i <= 10; i++ {
+		wg.Add(1)
+		go func() {
+			for rq := range copyRequests {
+				newDest := path.Join(destPrefix, strings.Replace(rq.Key, rq.OriginalPrefix, "", 1))
+				msgs <- fmt.Sprintf("Copying s3://%s/%s -> s3://%s/%s\n", srcBucket, rq.Key, destBucket, newDest)
+				copySrcKey := path.Join(srcBucket, rq.Key)
+				err := s3wrapper.Copy(b, copySrcKey, newDest)
+				if err != nil {
+					log.Fatalln(err)
+				}
+			}
+			wg.Done()
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(msgs)
+	}()
+	for msg := range msgs {
+		logger.Print(msg)
+	}
+}
+
+// getRegexOrNil
+func getRegexOrNil(r string) *regexp.Regexp {
+	if r != "" {
+		return regexp.MustCompile(r)
+	}
+	return nil
+}
+
+func isKeyMatch(key string, r *regexp.Regexp) bool {
+	return r == nil || r.MatchString(key)
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	logBuf := bufio.NewWriter(os.Stdout)
@@ -418,6 +471,8 @@ func main() {
 		Get(*getS3Uris, *getSearchDepth, *getKeyRegex, logger)
 	case "stream":
 		Stream(*streamS3Uris, *streamSearchDepth, *streamKeyRegex, *streamIncludeKeyName, logger)
+	case "cp":
+		Copy(*cpSrc, *cpDest, *cpKeyRegex, *cpSearchDepth, logger)
 	case "init":
 		Init(logger)
 	}

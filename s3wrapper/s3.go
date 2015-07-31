@@ -273,28 +273,21 @@ func DeleteMulti(bucket *s3.Bucket, keys []string) error {
 	return nil
 }
 
-// min function for integers
-func intMin(x, y int) int {
-	if x < y {
-		return x
-	}
-	return y
-}
+func Copy(bucket *s3.Bucket, srcKey string, destKey string) error {
+	attempts := 0
+	for {
+		attempts++
+		_, err := bucket.PutCopy(destKey, s3.PublicReadWrite, s3.CopyOptions{}, srcKey)
+		if err != nil {
+			if attempts >= maxRetries {
+				return err
+			}
 
-func intMax(x, y int) int {
-	if x < y {
-		return y
+			time.Sleep(time.Second * 3)
+		} else {
+			break
+		}
 	}
-	return x
-}
+	return nil
 
-// partition partitions list into list of lists where len(lists) <= partitions
-func partition(list []listWork, partitionSize int) [][]listWork {
-	partitions := [][]listWork{}
-	step := intMax(len(list)/partitionSize, 1)
-	for i := 0; i < len(list); i += step {
-		outerBound := intMin(len(list), i+step)
-		partitions = append(partitions, list[i:outerBound])
-	}
-	return partitions
 }
